@@ -1,7 +1,16 @@
+mod config;
+mod dns;
 mod encrypt;
-use std::fs;
+
+use std::env;
+use std::io;
+use std::thread;
 use std::time::Duration;
-use std::{io, thread};
+
+use config::Config;
+use dns::resolve_via_dns;
+
+const PROBE_DOMAIN: &str = "www.baidu.com";
 
 fn extract<'a>(text: &'a str, prefix: &'a str, suffix: &'a str) -> io::Result<&'a str> {
     let left = text.find(prefix);
@@ -14,12 +23,31 @@ fn extract<'a>(text: &'a str, prefix: &'a str, suffix: &'a str) -> io::Result<&'
     Err(io::ErrorKind::InvalidData.into())
 }
 
-fn login(username: &str, password: &str) -> io::Result<()> {
-    let resp = minreq::get("http://www.baidu.com")
+fn login(username: &str, password: &str, campus_dns: Option<&str>) -> io::Result<()> {
+    let target_ip = if let Some(dns) = campus_dns {
+        match resolve_via_dns(PROBE_DOMAIN, dns) {
+            Ok(ip) => {
+                println!("resolved {} via DNS {}: {}", PROBE_DOMAIN, dns, ip);
+                ip
+            }
+            Err(e) => {
+                println!("Warning: DNS resolution failed: {}, falling back to system DNS", e);
+                PROBE_DOMAIN.to_string()
+            }
+        }
+    } else {
+        PROBE_DOMAIN.to_string()
+    };
+
+    let probe_url = format!("http://{}/", target_ip);
+
+    let resp = minreq::get(&probe_url)
+        .with_header("Host", PROBE_DOMAIN)
+        .with_header("User-Agent", "Mozilla/5.0")
         .with_timeout(10)
         .send()
         .map_err(|e| {
-            println!("baidu boom! {}", e);
+            println!("probe request failed: {}", e);
             io::ErrorKind::ConnectionRefused
         })?;
     let resp = resp.as_str().map_err(|e| {
@@ -88,103 +116,45 @@ fn login(username: &str, password: &str) -> io::Result<()> {
 
 #[test]
 fn login_test() {
-    let _ = login("username", "password");
-}
-
-struct Config {
-    username: String,
-    password: String,
-}
-
-impl Config {
-    fn validate_and_assemble(
-        username: Option<&str>,
-        password: Option<&str>,
-    ) -> Result<Self, &'static str> {
-        match (username, password) {
-            (Some(_), None) => Err("missing password"),
-            (None, Some(_)) => Err("missing username"),
-            (None, None) => Err("missing username and password"),
-            (Some(username), Some(password)) => Ok(Self {
-                username: username.to_owned(),
-                password: password.to_owned(),
-            }),
-        }
-    }
-
-    pub fn from_env() -> Option<Self> {
-        println!("reading configuration from environment variables");
-        let username = std::env::var("HUST_NETWORK_LOGIN_USERNAME")
-            .inspect_err(|err| println!("failed to read environment variable: {err}"))
-            .ok();
-        let password = std::env::var("HUST_NETWORK_LOGIN_PASSWORD")
-            .inspect_err(|err| println!("failed to read environment variable: {err}"))
-            .ok();
-
-        let result = Self::validate_and_assemble(
-            username.as_ref().map(String::as_str),
-            password.as_ref().map(String::as_str),
-        )
-        .inspect_err(|err| println!("invalid configuration: {err}"))
-        .ok()?;
-
-        Some(result)
-    }
-
-    pub fn from_file(path: &str) -> Option<Self> {
-        println!("reading configuration from file: {path}");
-
-        let raw = fs::read(&path)
-            .inspect_err(|err| println!("failed to read from {path}: {err}"))
-            .ok()?;
-
-        let configuration = String::from_utf8(raw)
-            .inspect_err(|err| println!("failed to parse content of {path}: {err}"))
-            .ok()?;
-
-        let mut lines = configuration.lines();
-        let username = lines.next();
-        let password = lines.next();
-        let result = Self::validate_and_assemble(username, password)
-            .inspect_err(|err| println!("invalid configuration: {err}"))
-            .ok()?;
-
-        Some(result)
-    }
-
-    pub fn from_args() -> Option<Self> {
-        println!("reading configuration from arguments");
-
-        let args = std::env::args();
-
-        let path = args
-            .skip(1) // skip executable path
-            .last()
-            .ok_or("at least 1 argument is required")
-            .inspect_err(|err| println!("no configuration file specified: {err}"))
-            .ok()?;
-
-        Self::from_file(&path)
-    }
+    let _ = login("username", "password", None);
 }
 
 fn main() {
     let config = Config::from_args()
-        .or_else(Config::from_env)
-        .or_else(|| Config::from_file("/etc/hust-network-login.conf"))
-        .or_else(|| Config::from_file("/etc/hust-network-login/config"))
-        .expect("no available configuration found");
+        .or_else(|| Config::from_env(false))
+        .or_else(|| Config::from_file("/etc/hust-network-login.conf", false))
+        .or_else(|| Config::from_file("/etc/hust-network-login/config", false))
+        .or_else(|| {
+            if cfg!(windows) {
+                let appdata = env::var("APPDATA").ok()?;
+                Config::from_file(&format!("{}\\hust-network-login\\config", appdata), false)
+            } else {
+                None
+            }
+        });
 
-    loop {
-        match login(&config.username, &config.password) {
-            Ok(_) => {
-                println!("login ok. awaiting...");
-                thread::sleep(Duration::from_secs(15));
+    match config {
+        Some(cfg) => {
+            println!(
+                "starting with DNS: {}",
+                cfg.campus_dns.as_deref().unwrap_or("system default")
+            );
+
+            loop {
+                match login(&cfg.username, &cfg.password, cfg.campus_dns.as_deref()) {
+                    Ok(_) => {
+                        println!("login ok. awaiting...");
+                        thread::sleep(Duration::from_secs(15));
+                    }
+                    Err(e) => {
+                        println!("error! {}", e);
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                }
             }
-            Err(e) => {
-                println!("error! {}", e);
-                thread::sleep(Duration::from_secs(1));
-            }
+        }
+        None => {
+            config::print_help_and_exit();
         }
     }
 }
